@@ -1,0 +1,52 @@
+// common.h 
+#ifndef COMMON_H 
+#define COMMON_H 
+
+// Include standard libraries prima di tutto
+#include <stdbool.h> 
+#include <stdint.h> 
+#include <stddef.h>
+
+// Poi include FreeRTOS
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+ 
+// — BLE → Wi‑Fi event types — 
+typedef enum { 
+    BLE_WIFI_EVT_BTN_PRESS,  // Start Wi‑Fi scan 
+    BLE_WIFI_EVT_CONNECT     // Connect to given SSID/PASSWORD 
+} ble_wifi_evt_type_t; 
+ 
+// — Payload for BLE → Wi‑Fi events — 
+typedef struct { 
+    ble_wifi_evt_type_t type; 
+    char ssid[32]; 
+    char password[64]; 
+} ble_wifi_evt_t; 
+ 
+// — Wi‑Fi → BLE event types — 
+typedef enum { 
+    WIFI_BLE_EVT_SCAN_DONE, 
+    WIFI_BLE_EVT_CONNECT_STATUS 
+} wifi_ble_evt_type_t; 
+ 
+#define MAX_WIFI_SCAN_RESULTS 8 
+ 
+// — Payload for Wi‑Fi → BLE events — 
+typedef struct { 
+    wifi_ble_evt_type_t type; 
+    uint8_t ssid_count; 
+    char ssid_list[MAX_WIFI_SCAN_RESULTS][32]; 
+} wifi_ble_evt_t; 
+ 
+// — flag globale che indica se siamo connessi al Wi‑Fi — 
+extern bool g_wifi_connected; 
+ 
+// — le due queue condivise fra BLE e Wi‑Fi — 
+extern QueueHandle_t ble_to_wifi_q; 
+extern QueueHandle_t wifi_to_ble_q; 
+ 
+// — inizializza le queue; chiamalo in app_main() PRIMA di tutto — 
+void queues_init(void); 
+ 
+#endif // COMMON_H

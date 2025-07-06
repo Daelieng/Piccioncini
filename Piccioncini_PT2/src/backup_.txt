@@ -1,0 +1,663 @@
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include <string.h>
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include <stdlib.h>  // Necessario per malloc/free
+#include "driver/gpio.h"
+
+// Test LED
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/adc.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
+
+#define ADC_CHANNEL ADC1_CHANNEL_6  // ADC1_CH6 = GPIO34 (esempio)
+#define ADC_ATTEN ADC_ATTEN_DB_11
+#define ADC_UNIT ADC_UNIT_1
+
+#define LED_FREQ_HZ 5000
+#define LED_RESOLUTION LEDC_TIMER_8_BIT  // 8 bit → 0–255
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_TIMER LEDC_TIMER_0
+
+// Canali LEDC
+#define LED_RED_GPIO   4
+#define LED_GREEN_GPIO 15
+#define LED_BLUE_GPIO  2
+
+#define LEDC_CHANNEL_RED   LEDC_CHANNEL_0
+#define LEDC_CHANNEL_GREEN LEDC_CHANNEL_1
+#define LEDC_CHANNEL_BLUE  LEDC_CHANNEL_2
+/// fine test led
+
+// BLE constants
+#define DEVICE_NAME "Piccioncino_Ila"
+#define SERVICE_UUID  0x00FF
+#define CHAR_UUID     0xFF01
+#define WIFI_STATUS_UUID 0xFF10
+#define COMMAND_UUID     0xFF11
+#define WIFI_SCAN_LIST_UUID  0xFF20
+#define WIFI_CONFIG_UUID     0xFF21
+
+static uint16_t service_handle = 0;
+static uint16_t wifi_status_handle = 0;
+static uint16_t command_handle = 0;
+static uint16_t wifi_scan_handle = 0; // Handle per la caratteristica wifi_scan
+static uint16_t wifi_config_handle = 0; // Handle per la caratteristica wifi_config (0xFF21)
+
+static char wifi_scan_result[256] = "";
+
+static const char *TAG = "BLE_INIT";
+
+#define ADV_CONFIG_FLAG     (1 << 0)
+#define SCAN_RSP_CONFIG_FLAG (1 << 1)
+
+static uint8_t adv_config_done = 0;
+
+// Dichiarazioni globali per il GATT server BLE
+static uint16_t handle_table[2];
+
+#define WIFI_TAG "WIFI_TAG"
+
+// Variabili globali per la connessione BLE
+static uint16_t ble_conn_id = 0;
+static esp_gatt_if_t global_ble_gatts_if = 0;
+
+typedef struct {
+    uint16_t char_handle;
+    uint16_t cccd_handle;
+} ble_characteristic_t;
+
+ble_characteristic_t wifi_scan_characteristic;
+
+static void update_wifi_status(bool connected) {
+    uint8_t status = connected ? '1' : '0';  // usa '1' o '0' come caratteri
+    ESP_LOGI(TAG, "Aggiornamento wifi_status a %c", status);
+
+    // Aggiorna il valore dell'attributo della caratteristica
+    esp_ble_gatts_set_attr_value(wifi_status_handle, sizeof(status), &status);
+
+    // Se c'è un client BLE connesso, invia una notifica per aggiornare il valore sul lato app
+    if (ble_conn_id != 0 && global_ble_gatts_if != 0) {
+        esp_ble_gatts_send_indicate(global_ble_gatts_if,
+                                    ble_conn_id,
+                                    wifi_status_handle,
+                                    sizeof(status),
+                                    &status,
+                                    false); // false per notifica, true per indicazione
+    }
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data){
+    //Scansione
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        uint16_t ap_count = 0;
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+
+        if (ap_count == 0) {
+            ESP_LOGI(WIFI_TAG, "Nessuna rete trovata.");
+            return;
+        }
+
+        // Allocazione dinamica per gli AP records (uso minimo di memoria)
+        wifi_ap_record_t *ap_records = malloc(sizeof(wifi_ap_record_t) * ap_count);
+        if (ap_records == NULL) {
+            ESP_LOGE(WIFI_TAG, "Errore nell'allocazione della memoria per gli AP records");
+            return;
+        }
+
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_records));
+        ESP_LOGI(WIFI_TAG, "Reti trovate: %d", ap_count);
+
+        // Creazione di una stringa contenente i nomi delle reti (prendo al massimo 6 AP)
+        char wifi_list[256] = "";
+        int max = (ap_count > 6 ? 6 : ap_count);
+        for (int i = 0; i < max; i++) {
+            const char *ssid = (const char *)ap_records[i].ssid;
+            // Aggiungi SSID alla lista
+            strncat(wifi_list, ssid, sizeof(wifi_list) - strlen(wifi_list) - 1);
+            if (i < max - 1) {
+                strncat(wifi_list, ", ", sizeof(wifi_list) - strlen(wifi_list) - 1);
+            }
+        }
+        strncpy(wifi_scan_result, wifi_list, sizeof(wifi_scan_result)-1);
+        wifi_scan_result[sizeof(wifi_scan_result)-1] = '\0';
+
+        ESP_LOGI(WIFI_TAG, "Lista SSID: %s", wifi_list);
+
+        // Aggiorna il valore della caratteristica wifi_scan
+        if (wifi_scan_handle != 0) {
+            esp_ble_gatts_set_attr_value(wifi_scan_handle, strlen(wifi_list), (uint8_t *)wifi_list);
+        }
+
+        // Scrivere la lista dei nomi delle reti sulla caratteristica wifi_scan
+        if (ble_conn_id != 0 && global_ble_gatts_if != 0 && wifi_scan_handle != 0) {
+            esp_ble_gatts_send_indicate(
+                global_ble_gatts_if,
+                ble_conn_id,
+                wifi_scan_handle,
+                strlen(wifi_list),
+                (uint8_t *)wifi_list,
+                false  // false per notifiche, true per indicazioni
+            );
+        }
+
+        free(ap_records);
+    }
+    //Connesso
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(WIFI_TAG, "Evento: STA_CONNECTED");                       // :contentReference[oaicite:2]{index=2}
+
+        // Ottengo le info dell'AP a cui sono connesso
+        wifi_ap_record_t ap_info;
+        esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);               // :contentReference[oaicite:3]{index=3}
+        if (ret == ESP_OK) {
+            // ap_info.ssid è una stringa non terminata da NULL, garantiamo terminatore
+            char ssid[33] = { 0 };
+            memcpy(ssid, ap_info.ssid, sizeof(ap_info.ssid));             // :contentReference[oaicite:4]{index=4}
+            ssid[32] = '\0';
+
+            ESP_LOGI(WIFI_TAG, "Connesso all'AP SSID: %s", ssid);        // :contentReference[oaicite:5]{index=5}
+        } else {
+            ESP_LOGE(WIFI_TAG, "Errore esp_wifi_sta_get_ap_info: %s",
+                     esp_err_to_name(ret));                               // :contentReference[oaicite:6]{index=6}
+        }
+
+        // Notifico anche il livello BLE
+        update_wifi_status(true);                                        // :contentReference[oaicite:7]{index=7}
+    }
+    //Connessione persa
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Estraggo il dettaglio del motivo (opzionale)
+        wifi_event_sta_disconnected_t* dis = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGI("WIFI_EVT", "STA_DISCONNECTED, reason=%d", dis->reason);  
+                                               
+        update_wifi_status(false);              // notifica BLE che siamo offline  
+        esp_wifi_connect();                     // tenta subito la riconnessione:contentReference[oaicite:7]{index=7}  
+    }
+}
+
+void wifi_init_sta() {
+    ESP_LOGI(WIFI_TAG, "Inizializzazione WiFi in modalità Station...");
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK( esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "",  // Connessione manuale
+            .password = "",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(WIFI_TAG, "WiFi station attiva");
+}
+
+static void wifi_scan_start(void) {
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+
+    if (ble_conn_id != 0 && global_ble_gatts_if != 0) {
+        ESP_LOGI(TAG, "Sono connesso a cose");
+    } else {
+        ESP_LOGI(TAG, "Nessuna connessione");
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, false));
+}
+
+static uint8_t service_uuid[16] = { 
+    0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static void advertizer_config(void) {
+    esp_ble_adv_data_t adv_data = {
+        .set_scan_rsp = false,
+        .include_name = true,
+        .include_txpower = true,
+        .appearance = ESP_BLE_APPEARANCE_UNKNOWN,
+        .manufacturer_len = 0,
+        .p_manufacturer_data = NULL,
+        .service_data_len = 0,
+        .p_service_data = NULL,
+        .service_uuid_len = 16,
+        .p_service_uuid = service_uuid,
+        .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT)
+    };
+
+    ESP_LOGI(TAG, "Settando advertising...");
+    ESP_ERROR_CHECK(esp_ble_gap_config_adv_data(&adv_data));
+    ESP_LOGI(TAG, "Advertizing impostato");
+}
+
+static void incoming_command(char* cmd) {
+    if (strcmp(cmd, "START_WIFI_SCAN") == 0) {
+        ESP_LOGI(TAG, "Avviando scansione WiFi...");
+        wifi_scan_start();
+    }
+    else {
+        ESP_LOGI(TAG, "Comando sconosciuto");
+    }
+}
+
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+        case ESP_GATTS_REG_EVT:
+            ESP_LOGI(TAG, "Registrato GATT, creando servizio...");
+            esp_ble_gatts_create_service(gatts_if, &(esp_gatt_srvc_id_t){
+                .id = { .uuid = { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = SERVICE_UUID } } },
+                .is_primary = true
+            }, 20);
+            break;
+
+        case ESP_GATTS_CREATE_EVT:
+            ESP_LOGI(TAG, "Servizio creato, aggiungendo caratteristica...");
+            service_handle = param->create.service_handle;
+            esp_ble_gatts_start_service(service_handle);
+            // Definizione della caratteristica dello stato del WiFi
+            esp_bt_uuid_t wifi_status_uuid = { .len = ESP_UUID_LEN_16, .uuid.uuid16 = WIFI_STATUS_UUID };
+            static uint8_t wifi_status_val[] = "N";
+            esp_attr_value_t wifi_status_att = {
+                .attr_max_len = sizeof(wifi_status_val),
+                .attr_len = sizeof(wifi_status_val),
+                .attr_value = wifi_status_val,
+            };
+            esp_err_t ret = esp_ble_gatts_add_char(service_handle,
+                &wifi_status_uuid,
+                ESP_GATT_PERM_READ,
+                ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
+                &wifi_status_att,
+                NULL);
+            if (ret != ESP_OK) {
+                ESP_LOGE("GATTS_DEMO", "Errore aggiunta WiFi_Status: %x", ret);
+            }
+            // Caratteristica Command
+            esp_bt_uuid_t command_uuid = {
+                .len = ESP_UUID_LEN_16,
+                .uuid.uuid16 = COMMAND_UUID,
+            };
+            static uint8_t command_val[] = "None";
+            esp_attr_value_t command_attr = {
+                .attr_max_len = sizeof(command_val),
+                .attr_len     = sizeof(command_val),
+                .attr_value   = command_val,
+            };
+            ret = esp_ble_gatts_add_char(service_handle,
+                                         &command_uuid,
+                                         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                         ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
+                                         &command_attr,
+                                         NULL);
+            if (ret != ESP_OK) {
+                ESP_LOGE("GATTS_DEMO", "Errore aggiunta Command: %x", ret);
+            }
+            // Caratteristica wifi_scan (FF20)
+            esp_bt_uuid_t wifi_scan_uuid = {
+                .len = ESP_UUID_LEN_16,
+                .uuid.uuid16 = WIFI_SCAN_LIST_UUID,
+            };
+            static uint8_t wifi_scan_val[] = "";
+            esp_attr_value_t wifi_scan_attr = {
+                .attr_max_len = 256,
+                .attr_len     = 0,
+                .attr_value   = wifi_scan_val,
+            };
+            ret = esp_ble_gatts_add_char(
+                service_handle,
+                &wifi_scan_uuid,
+                ESP_GATT_PERM_READ,
+                ESP_GATT_CHAR_PROP_BIT_READ,
+                &wifi_scan_attr,
+                NULL
+            );
+            if (ret != ESP_OK) {
+                ESP_LOGE("GATTS_DEMO", "Errore aggiunta WiFi_Scan: %x", ret);
+            }
+            // Aggiunta del descrittore per wifi_scan
+            ret = esp_ble_gatts_add_char_descr(
+                service_handle,
+                &(esp_bt_uuid_t){.len = ESP_UUID_LEN_16, .uuid = {.uuid16 = 0x2902}},
+                ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                NULL,
+                NULL
+            );
+            if (ret == ESP_OK) {
+                esp_ble_gatts_add_char_descr(
+                    service_handle,
+                    &(esp_bt_uuid_t){.len = ESP_UUID_LEN_16, .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG}}, 
+                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                    NULL,
+                    NULL
+                );
+            }
+            // Caratteristica WiFi config (FF21)
+            esp_bt_uuid_t wifi_config_uuid = {
+                .len = ESP_UUID_LEN_16,
+                .uuid.uuid16 = WIFI_CONFIG_UUID,
+            };
+            static uint8_t wifi_config_val[] = "None";
+            esp_attr_value_t wifi_config_attr = {
+                .attr_max_len = 64,
+                .attr_len     = sizeof(wifi_config_val),
+                .attr_value   = wifi_config_val,
+            };
+            ret = esp_ble_gatts_add_char(service_handle,
+                &wifi_config_uuid,
+                ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE,
+                &wifi_config_attr,
+                NULL);
+
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Errore aggiunta WiFi_Config: %s", esp_err_to_name(ret));
+            }
+            esp_ble_gatts_add_char_descr(
+                service_handle,
+                &(esp_bt_uuid_t){.len = ESP_UUID_LEN_16, .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG}},
+                ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                NULL,
+                NULL
+            );
+            break;
+
+        case ESP_GATTS_ADD_CHAR_EVT:
+            ESP_LOGI(TAG, "Caratteristica aggiunta, avviando servizio...");
+            if (param->add_char.char_uuid.uuid.uuid16 == WIFI_STATUS_UUID) {
+                wifi_status_handle = param->add_char.attr_handle;
+                ESP_LOGI("GATTS_DEMO", "WiFi_Status aggiunta, handle = %d", wifi_status_handle);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == COMMAND_UUID) {
+                command_handle = param->add_char.attr_handle;
+                ESP_LOGI("GATTS_DEMO", "Command aggiunta, handle = %d", command_handle);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == WIFI_SCAN_LIST_UUID) {
+                wifi_scan_handle = param->add_char.attr_handle;
+                ESP_LOGI(TAG, "WiFi_Scan aggiunta, handle = %d", wifi_scan_handle);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == WIFI_CONFIG_UUID) {
+                wifi_config_handle = param->add_char.attr_handle;
+                ESP_LOGI(TAG, "WiFi_Config aggiunta, handle = %d", wifi_config_handle);
+            }
+            advertizer_config();
+            break;
+
+        case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+            if (param->add_char_descr.descr_uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG) {
+                wifi_scan_characteristic.cccd_handle = param->add_char_descr.attr_handle;
+                ESP_LOGI(TAG, "CCCD descriptor handle: %d", wifi_scan_characteristic.cccd_handle);
+            }
+            break;
+
+        case ESP_GATTS_WRITE_EVT:
+            ESP_LOGI(TAG, "Evento scrittura ricevuto");
+            if (param->write.handle == command_handle) {
+                // Risposta immediata
+                esp_ble_gatts_send_response(
+                    gatts_if,
+                    param->write.conn_id,
+                    param->write.trans_id,
+                    ESP_GATT_OK,
+                    NULL
+                );
+                // Elabora il comando dopo aver inviato la risposta
+                if (param->write.len > 0) {
+                    char cmd[param->write.len + 1];
+                    memcpy(cmd, param->write.value, param->write.len);
+                    cmd[param->write.len] = '\0';
+                    incoming_command(cmd);
+                }
+            }
+            else if (param->write.handle == wifi_config_handle) {
+                // Nuovo codice per gestione WiFi Config
+                ESP_LOGI(TAG, "credenziali: %s", (char *)param->write.value);
+                    // Nuovo codice per gestione WiFi Config
+                    esp_ble_gatts_send_response(
+                        gatts_if,
+                        param->write.conn_id,
+                        param->write.trans_id,
+                        ESP_GATT_OK,
+                        NULL
+                    );
+                    
+                    if (param->write.len > 0) {
+                        // Alloca memoria e aggiungi terminatore null
+                        const char *to_decode=(char *)param->write.value;
+
+                        char *start1 = strstr(to_decode, "%%");
+                        if (start1==NULL){
+                            ESP_LOGI(TAG, "Errore all'inizio");
+                        }
+                        start1+=2;
+                        char *end1=strstr(start1, "%%");
+                        if (end1==NULL){
+                            ESP_LOGI(TAG, "Non trovo l fine di ssid");
+                        }
+                        size_t len1=end1-start1;
+                        char *ssid=malloc(len1+1);
+                        strncpy(ssid, start1, len1);
+                        ssid[len1]='\0';
+
+                        char *start2 = end1 + 2;
+    
+                        // Trova la fine di string2
+                        char *end2 = strstr(start2, "%%");
+                        if (end2 == NULL) {
+                            printf("Formato non valido per string2!\n");
+                        }
+                        
+                        // Estrae string2
+                        size_t len2 = end2 - start2;
+                        char *password = malloc(len2 + 1);
+                        strncpy(password, start2, len2);
+                        password[len2] = '\0';
+
+                        ESP_LOGI(TAG, "SSID: %s, Password: %s", ssid, password);
+                        
+                        if (ssid != NULL && password != NULL) {
+                            ESP_LOGI(TAG, "SSID: %s, Password: %s", ssid, password);
+                            
+                            wifi_config_t wifi_config = {
+                                .sta = {
+                                    .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+                                    .pmf_cfg = {
+                                        .capable = true,
+                                        .required = false
+                                    },
+                                },
+                            };
+                            
+                            // Copia sicura con strlcpy (se disponibile) o strncpy
+                            strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+                            wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
+                            
+                            strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+                            wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
+                            
+                            ESP_LOGI(TAG, "Configurando WiFi...");
+                            esp_wifi_disconnect();
+                            esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+                            if (ret != ESP_OK) {
+                                ESP_LOGE(TAG, "Errore configurazione WiFi: %s", esp_err_to_name(ret));
+                            } else {
+                                ret = esp_wifi_connect();
+                                if (ret != ESP_OK) {
+                                    ESP_LOGE(TAG, "Errore connessione WiFi: %s", esp_err_to_name(ret));
+                                }
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "Formato dati non valido. Atteso: %%SSID%%PASSWORD%%. Invece ho letto: %s, %s", ssid, password);
+                        }
+                    }
+                }
+            break;
+            
+        case ESP_GATTS_CONNECT_EVT:
+            ESP_LOGI(TAG, "Client connesso");
+            ble_conn_id = param->connect.conn_id;
+            global_ble_gatts_if = gatts_if;
+            break;
+            
+        case ESP_GATTS_DISCONNECT_EVT:
+            ESP_LOGI(TAG, "Client disconnesso");
+            ble_conn_id = 0;
+            global_ble_gatts_if = 0;
+            break;
+
+        case ESP_GATTS_READ_EVT: {
+            ESP_LOGI(TAG, "GATT Read Request for characteristic handle: %d", param->read.handle);
+            
+            esp_gatt_rsp_t rsp;
+            memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+            rsp.attr_value.handle = param->read.handle;
+            
+            // Se il read riguarda la caratteristica wifi_scan, usa il contenuto di wifi_scan_result
+            if (param->read.handle == wifi_scan_handle) {
+                size_t len = strlen(wifi_scan_result);
+                rsp.attr_value.len = len;
+                memcpy(rsp.attr_value.value, wifi_scan_result, len);
+            } else {
+                // Gestisci altri casi se necessario
+            }
+            
+            esp_err_t err = esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
+            ESP_LOGI(TAG, "Invio risposta: %s (len: %d)", wifi_scan_result, (int)strlen(wifi_scan_result));
+            ESP_LOGI(TAG, "Contenuto: %s", rsp.attr_value.value);
+
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Error sending GATT response: %d", err);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    ESP_LOGI(TAG, "Evento GAP ricevuto: %d", event);
+    if (event == ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT) {
+        adv_config_done |= ADV_CONFIG_FLAG;
+        if (adv_config_done == (ADV_CONFIG_FLAG)) {
+            ESP_LOGI(TAG, "Avviando advertising...");
+            esp_ble_gap_start_advertising(&(esp_ble_adv_params_t){
+                .adv_int_min = 0x20,
+                .adv_int_max = 0x40,
+                .adv_type = ADV_TYPE_IND,
+                .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+                .channel_map = ADV_CHNL_ALL,
+                .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY
+            });
+        }
+    }
+    else if (event == ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT) {
+        adv_config_done |= SCAN_RSP_CONFIG_FLAG;
+        if (adv_config_done == (ADV_CONFIG_FLAG | SCAN_RSP_CONFIG_FLAG)) {
+            ESP_LOGI(TAG, "Tutti i dati configurati, pronto per l'advertising");
+        }
+    }
+}
+
+void BLE_setting() {
+    esp_bt_controller_config_t ble_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&ble_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    
+    ESP_ERROR_CHECK(esp_ble_gap_set_device_name(DEVICE_NAME));
+
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+    ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_event_handler));
+    ESP_ERROR_CHECK(esp_ble_gatts_app_register(0));
+}
+
+void setup_ledc(void)
+{
+    // 1) config timer PWM
+    ledc_timer_config_t timer_conf = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER,
+        .duty_resolution  = LED_RESOLUTION,
+        .freq_hz          = LED_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer_conf);
+
+    // 2) config canali per ciascun colore
+    ledc_channel_config_t ch_conf = {
+        .speed_mode     = LEDC_MODE,
+        .timer_sel      = LEDC_TIMER,
+        .duty           = 0,     // partiamo da LED spenti
+        .hpoint         = 0,
+        .flags.output_invert = 0
+    };
+
+    ch_conf.gpio_num = LED_RED_GPIO;
+    ch_conf.channel  = LEDC_CHANNEL_RED;
+    ledc_channel_config(&ch_conf);
+
+    ch_conf.gpio_num = LED_GREEN_GPIO;
+    ch_conf.channel  = LEDC_CHANNEL_GREEN;
+    ledc_channel_config(&ch_conf);
+
+    ch_conf.gpio_num = LED_BLUE_GPIO;
+    ch_conf.channel  = LEDC_CHANNEL_BLUE;
+    ledc_channel_config(&ch_conf);
+}
+
+// Funzione unica per impostare i PWM R, G, B
+// red, green, blue: valori 0–255
+void set_rgb_pwm(uint8_t red, uint8_t green, uint8_t blue)
+{
+    // Rosso
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_RED, red);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_RED);
+    // Verde
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GREEN, green);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GREEN);
+    // Blu
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_BLUE, blue);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_BLUE);
+}
+
+
+void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    wifi_init_sta();
+    BLE_setting();
+
+    setup_ledc();
+
+    while (1) {
+        // 1) leggi analogico 0–4095
+        uint8_t rr = 255;
+        uint8_t gg = 0;
+        uint8_t bb = 0;
+        // 3) applica lo stesso valore agli R,G,B (colore bianco variabile)
+        set_rgb_pwm(rr, gg , bb);
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
